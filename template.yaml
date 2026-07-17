@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  walk-planner: a nightly Lambda that reads tomorrow's Open-Meteo forecast,
+  scores daylight half-hour slots, and emails two suggested 30-minute walk
+  windows for the next day.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Delivery }
+        Parameters: [NotificationEmail]
+      - Label: { default: Location and schedule }
+        Parameters: [Latitude, Longitude, TimeZone, ScheduleExpression]
+      - Label: { default: Walk preferences }
+        Parameters:
+          - WindowStartHour
+          - WindowEndHour
+          - IdealTempMin
+          - IdealTempMax
+          - MinSeparationMinutes
+      - Label: { default: Code location }
+        Parameters: [CodeS3Bucket, CodeS3Key, BedrockModelId]
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Address to receive the daily note. You must click the confirmation link SNS sends.
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: Must be a valid email address.
+
+  Latitude:
+    Type: Number
+    Default: 35.7796
+    MinValue: -90
+    MaxValue: 90
+
+  Longitude:
+    Type: Number
+    Default: -78.6382
+    MinValue: -180
+    MaxValue: 180
+
+  TimeZone:
+    Type: String
+    Default: America/New_York
+    Description: IANA timezone name. Drives both the cron trigger and the forecast times.
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 20 * * ? *)
+    Description: >
+      When to run, in the timezone above. Default is 8:00 pm daily, planning the
+      following day. Keep this before midnight local -- after midnight, "tomorrow"
+      becomes the day after the one you meant.
+
+  WindowStartHour:
+    Type: Number
+    Default: 6
+    MinValue: 0
+    MaxValue: 23
+    Description: Earliest hour you would consider walking (24h local time).
+
+  WindowEndHour:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 24
+    Description: Latest hour you would consider walking (24h local time).
+
+  IdealTempMin:
+    Type: Number
+    Default: 50
+    Description: Bottom of your comfort band for apparent temperature (F).
+
+  IdealTempMax:
+    Type: Number
+    Default: 72
+    Description: Top of your comfort band for apparent temperature (F).
+
+  MinSeparationMinutes:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    Description: Minimum gap between the two proposals, so they are real alternatives.
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-5-haiku-20241022-v1:0
+    Description: >
+      Bedrock model for the rationale text. In most regions you will need a
+      cross-region inference profile ID instead, e.g. us.anthropic.claude-3-5-haiku-20241022-v1:0
+
+  CodeS3Bucket:
+    Type: String
+    Description: S3 bucket holding the deployment zip. Must be in this stack's region.
+
+  CodeS3Key:
+    Type: String
+    Default: walk-planner/handler.zip
+
+Resources:
+
+  # --- Delivery ------------------------------------------------------------
+
+  WalkTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-walk-windows'
+      DisplayName: Walk windows
+
+  WalkSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WalkTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Scheduler drops failed invocations here rather than losing them silently.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # --- Function ------------------------------------------------------------
+
+  # Declared explicitly so retention is managed by the stack and the group is
+  # removed on delete. Lambda would otherwise create it with no expiry.
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-walk-planner'
+      RetentionInDays: 14
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: walk-planner
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt FunctionLogGroup.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref WalkTopic
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+
+  WalkPlannerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FunctionLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-walk-planner'
+      Description: Proposes two optimal 30-minute walk windows for tomorrow.
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: handler.lambda_handler
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref WalkTopic
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          LATITUDE: !Ref Latitude
+          LONGITUDE: !Ref Longitude
+          TIMEZONE: !Ref TimeZone
+          WINDOW_START_HOUR: !Ref WindowStartHour
+          WINDOW_END_HOUR: !Ref WindowEndHour
+          IDEAL_TEMP_MIN: !Ref IdealTempMin
+          IDEAL_TEMP_MAX: !Ref IdealTempMax
+          MIN_SEPARATION_MINUTES: !Ref MinSeparationMinutes
+
+  # --- Trigger -------------------------------------------------------------
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-walk-planner
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt WalkPlannerFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  DailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-daily'
+      Description: Fires the walk planner each evening to plan the next day, local time.
+      State: ENABLED
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt WalkPlannerFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+
+  # --- Monitoring ----------------------------------------------------------
+
+  # Without this, a broken function just means no email -- which is
+  # indistinguishable from a quiet week until you notice a month later.
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      AlarmDescription: The walk planner failed. Check the log group.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WalkPlannerFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref WalkTopic]
+
+Outputs:
+  FunctionName:
+    Description: Invoke this manually to test without waiting for tomorrow.
+    Value: !Ref WalkPlannerFunction
+  TopicArn:
+    Value: !Ref WalkTopic
+  LogGroup:
+    Value: !Ref FunctionLogGroup
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
